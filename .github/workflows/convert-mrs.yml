@@ -2,10 +2,28 @@ name: Convert YAML to MRS
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "GeositeCN_Domain.yaml"
-      - ".github/workflows/convert-mrs.yml"
+    inputs:
+      yaml_file:
+        description: "选择要转换的域名 YAML（新文件可选 Custom path）"
+        required: true
+        type: choice
+        default: ChinaMax_Domain.yaml
+        options:
+          - ChinaMax_Domain.yaml
+          - GeositeCN_Domain.yaml
+          - Custom path
+      custom_path:
+        description: "选择 Custom path 时填写仓库内路径，例如 rules/Example.yaml"
+        required: false
+        type: string
+      behavior:
+        description: "规则类型：纯域名选 domain；纯 IP 网段选 ipcidr"
+        required: true
+        type: choice
+        default: domain
+        options:
+          - domain
+          - ipcidr
 
 permissions:
   contents: write
@@ -17,10 +35,37 @@ concurrency:
 jobs:
   convert:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Validate selected file
+        id: files
+        env:
+          SELECTED_FILE: ${{ inputs.yaml_file }}
+          CUSTOM_PATH: ${{ inputs.custom_path }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, subprocess
+          name = (os.environ["CUSTOM_PATH"] if os.environ["SELECTED_FILE"] == "Custom path" else os.environ["SELECTED_FILE"]).strip()
+          if not name or any(ord(c) < 32 for c in name):
+              raise SystemExit("文件路径不能为空或包含控制字符")
+          root = pathlib.Path.cwd().resolve()
+          source = (root / name).resolve()
+          if not source.is_relative_to(root) or ".git" in source.relative_to(root).parts:
+              raise SystemExit("只能转换当前仓库内的文件")
+          if source.suffix.lower() not in (".yaml", ".yml") or not source.is_file():
+              raise SystemExit("文件不存在，或后缀不是 .yaml / .yml：" + name)
+          relative = source.relative_to(root).as_posix()
+          subprocess.run(["git", "ls-files", "--error-unmatch", "--", relative], check=True)
+          target = source.with_suffix(".mrs")
+          if target.is_symlink():
+              raise SystemExit("输出文件不能是符号链接")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("source=" + relative + "\n")
+              f.write("target=" + target.relative_to(root).as_posix() + "\n")
+          PY
 
       - name: Download Mihomo
         env:
@@ -28,48 +73,59 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           download_url=$(gh api repos/MetaCubeX/mihomo/releases/latest \
             --jq '[.assets[] | select(.name | test("^mihomo-linux-amd64-(v1|compatible)-v[0-9].*\\.gz$"))][0].browser_download_url')
-
           if [[ -z "$download_url" || "$download_url" == "null" ]]; then
             echo "未找到适用的 Mihomo Linux 稳定版"
             exit 1
           fi
-
-          curl -fL --retry 3 "$download_url" \
-            -o "$RUNNER_TEMP/mihomo.gz"
-
-          gzip -dc "$RUNNER_TEMP/mihomo.gz" \
-            > "$RUNNER_TEMP/mihomo"
-
+          curl -fL --retry 3 "$download_url" -o "$RUNNER_TEMP/mihomo.gz"
+          gzip -dc "$RUNNER_TEMP/mihomo.gz" > "$RUNNER_TEMP/mihomo"
           chmod +x "$RUNNER_TEMP/mihomo"
+          "$RUNNER_TEMP/mihomo" -v
 
-      - name: Convert domain rules
+      - name: Convert selected YAML
+        env:
+          SOURCE_FILE: ${{ steps.files.outputs.source }}
+          TARGET_FILE: ${{ steps.files.outputs.target }}
+          RULE_BEHAVIOR: ${{ inputs.behavior }}
         shell: bash
         run: |
           set -euo pipefail
+          case "$RULE_BEHAVIOR" in
+            domain|ipcidr) ;;
+            *) echo "不支持的规则类型"; exit 1 ;;
+          esac
+          "$RUNNER_TEMP/mihomo" convert-ruleset \
+            "$RULE_BEHAVIOR" yaml "$SOURCE_FILE" "$TARGET_FILE"
+          test -s "$TARGET_FILE"
 
-          "$RUNNER_TEMP/mihomo" convert-ruleset domain yaml \
-            "GeositeCN_Domain.yaml" \
-            "GeositeCN_Domain.mrs"
-
-          test -s "GeositeCN_Domain.mrs"
-
-      - name: Commit MRS file
+      - name: Commit MRS and show URL
+        env:
+          TARGET_FILE: ${{ steps.files.outputs.target }}
         shell: bash
         run: |
           set -euo pipefail
-
           git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add -- "GeositeCN_Domain.mrs"
-
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$TARGET_FILE"
           if git diff --cached --quiet; then
             echo "MRS 内容没有变化，无需提交"
           else
-            git commit -m "Update GeositeCN_Domain.mrs"
+            git commit -m "Update MRS rule set"
             git push
           fi
+          python3 - <<'PY'
+          import os
+          from urllib.parse import quote
+          path = os.environ["TARGET_FILE"]
+          branch = os.environ["GITHUB_REF_NAME"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          url = "https://raw.githubusercontent.com/" + repo + "/refs/heads/" + quote(branch, safe="/") + "/" + quote(path, safe="/")
+          print("MRS Raw URL: " + url)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("## 转换完成\n\n")
+              f.write("输出文件：" + path + "\n\n")
+              f.write("完整 Raw 链接：\n\n" + url + "\n")
+          PY
+
