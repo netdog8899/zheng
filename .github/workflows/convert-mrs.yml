@@ -1,0 +1,75 @@
+name: Convert YAML to MRS
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "GeositeCN_Domain.yaml"
+      - ".github/workflows/convert-mrs.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: convert-mrs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Mihomo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          download_url=$(gh api repos/MetaCubeX/mihomo/releases/latest \
+            --jq '[.assets[] | select(.name | test("^mihomo-linux-amd64-(v1|compatible)-v[0-9].*\\.gz$"))][0].browser_download_url')
+
+          if [[ -z "$download_url" || "$download_url" == "null" ]]; then
+            echo "未找到适用的 Mihomo Linux 稳定版"
+            exit 1
+          fi
+
+          curl -fL --retry 3 "$download_url" \
+            -o "$RUNNER_TEMP/mihomo.gz"
+
+          gzip -dc "$RUNNER_TEMP/mihomo.gz" \
+            > "$RUNNER_TEMP/mihomo"
+
+          chmod +x "$RUNNER_TEMP/mihomo"
+
+      - name: Convert domain rules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          "$RUNNER_TEMP/mihomo" convert-ruleset domain yaml \
+            "GeositeCN_Domain.yaml" \
+            "GeositeCN_Domain.mrs"
+
+          test -s "GeositeCN_Domain.mrs"
+
+      - name: Commit MRS file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- "GeositeCN_Domain.mrs"
+
+          if git diff --cached --quiet; then
+            echo "MRS 内容没有变化，无需提交"
+          else
+            git commit -m "Update GeositeCN_Domain.mrs"
+            git push
+          fi
